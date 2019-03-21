@@ -1,25 +1,11 @@
-module JsonRPC
-    exposing
-        ( Context
-        , mapCtx
-        , readCtx
-        , updateState
-        , readState
-        , Command
-        , return
-        , fail
-        , map
-        , map2
-        , mapError
-        , andThen
-        , requestBody
-        , noop
-        , request
-        , run
-        , finalState
-        , foldList
-        , simpleParam
-        )
+module JsonRPC exposing
+    ( Context
+    , Command
+    , request, return, fail, map, map2, andThen, noop, run
+    , mapCtx, readCtx, updateState, readState, finalState, mapError
+    , foldList
+    , requestBody, simpleParam
+    )
 
 {-| This library helps with building and chaining stateful JSON RPC
 requests. While running a single RPC request (and handling all
@@ -113,7 +99,7 @@ map fn cmd =
 map2 : (a -> b -> c) -> Command state err a -> Command state err b -> Command state err c
 map2 fn cmda cmdb =
     cmda
-        |> andThen (\a -> (map (fn a) cmdb))
+        |> andThen (\a -> map (fn a) cmdb)
 
 
 {-| Transform the error value. This can be useful when you need to
@@ -135,11 +121,16 @@ mapError fn cmd =
     Task.mapError fn << cmd
 
 
+apply : (a -> Command state err b) -> ( Context state, a ) -> Task err ( Context state, b )
+apply gen ( ctx, a ) =
+    gen a ctx
+
+
 {-| Chain a command and a command-producing function.
 -}
 andThen : (a -> Command state err b) -> Command state err a -> Command state err b
 andThen next cmd =
-    cmd >> Task.andThen (uncurry (flip next))
+    cmd >> Task.andThen (apply next)
 
 
 {-| Utility function to make a request parameter pair from two
@@ -163,7 +154,7 @@ requestBody method id params =
             , simpleParam "jsonrpc" "2.0"
             ]
     in
-        Encode.object body |> Http.jsonBody
+    Encode.object body |> Http.jsonBody
 
 
 {-| Empty, do-nothing command.
@@ -198,6 +189,32 @@ updateState fn =
     mapCtx (\ctx -> { ctx | state = fn ctx.state })
 
 
+jsonResolver : Decode.Decoder a -> Http.Resolver Http.Error a
+jsonResolver decoder =
+    Http.stringResolver <|
+        \response ->
+            case response of
+                Http.BadUrl_ url ->
+                    Err (Http.BadUrl url)
+
+                Http.Timeout_ ->
+                    Err Http.Timeout
+
+                Http.NetworkError_ ->
+                    Err Http.NetworkError
+
+                Http.BadStatus_ metadata body ->
+                    Err (Http.BadStatus metadata.statusCode)
+
+                Http.GoodStatus_ metadata body ->
+                    case Decode.decodeString decoder body of
+                        Ok value ->
+                            Ok value
+
+                        Err err ->
+                            Err (Http.BadBody (Decode.errorToString err))
+
+
 {-| Construct a command from a method name, list of parameters, and a JSON decoder.
 -}
 request : String -> List ( String, Encode.Value ) -> Decode.Decoder a -> Command state Http.Error a
@@ -209,9 +226,15 @@ request method params decoder ctx =
         nctx =
             { ctx | rpcId = id + 1 }
     in
-        Http.post ctx.url (requestBody method id params) (Decode.field "result" decoder)
-            |> Http.toTask
-            |> Task.map (\a -> ( nctx, a ))
+    Http.task
+        { url = ctx.url
+        , method = "post"
+        , headers = []
+        , body = requestBody method id params
+        , timeout = Nothing
+        , resolver = jsonResolver (Decode.field "result" decoder)
+        }
+        |> Task.map (\a -> ( nctx, a ))
 
 
 {-| Run the chain of commands. You need to provide the initial
@@ -225,8 +248,8 @@ run url initState display command =
         initCtx =
             { rpcId = 0, url = url, state = initState }
     in
-        command initCtx
-            |> Task.attempt (Result.map Tuple.second >> display)
+    command initCtx
+        |> Task.attempt (Result.map Tuple.second >> display)
 
 
 {-| A dummy command that just produces the context as its value.
